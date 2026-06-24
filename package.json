@@ -1,0 +1,18 @@
+{
+  "name": "qa-workbench-sf-tests",
+  "version": "1.0.0",
+  "description": "Playwright test scripts for Salesforce QA Workbench",
+  "private": true,
+  "scripts": {
+    "test":           "playwright test",
+    "test:community": "playwright test tests/community/",
+    "test:sales":     "playwright test tests/sales/",
+    "test:cross":     "playwright test tests/cross-app/",
+    "report":         "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.44.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
+  }
+}
