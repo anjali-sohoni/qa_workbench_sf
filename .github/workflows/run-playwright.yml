@@ -1,0 +1,259 @@
+name: Run Playwright Tests
+
+# Triggered by the QA Workbench Lambda after pushing a spec file.
+# Always runs on the default branch (where the workflow file lives).
+# Fetches the exact spec commit via commit_sha input so test files are
+# always found regardless of branch state.
+on:
+  workflow_dispatch:
+    inputs:
+      story_id:
+        description: 'Story ID (e.g. US-0001) — used to label the report'
+        required: false
+        default: ''
+      actor:
+        description: 'Who triggered the run'
+        required: false
+        default: 'ci'
+      commit_sha:
+        description: 'Exact commit SHA containing the spec files (pushed by QA Workbench)'
+        required: false
+        default: ''
+      spec_paths:
+        description: 'Comma-separated spec file paths to run (e.g. tests/cross-app/TC-0001-02.spec.ts)'
+        required: false
+        default: ''
+      project:
+        description: 'Project code (e.g. SF-v1) — used to filter runs in the dashboard'
+        required: false
+        default: ''
+
+permissions:
+  id-token: write   # required for AWS OIDC (configure-aws-credentials)
+  contents: read    # required for actions/checkout
+
+jobs:
+  playwright:
+    name: Playwright Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout default branch (config + workflow lives here)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need full history to fetch arbitrary commits
+
+      - name: Fetch spec files from the pushed commit
+        run: |
+          SHA="${{ github.event.inputs.commit_sha }}"
+          PATHS="${{ github.event.inputs.spec_paths }}"
+
+          if [ -z "$SHA" ]; then
+            echo "No commit_sha provided — using files already on this branch."
+          else
+            echo "Fetching spec commit $SHA..."
+            git fetch origin "$SHA" 2>/dev/null || git fetch --all
+            if [ -n "$PATHS" ]; then
+              # Checkout only the specific spec files from the commit
+              echo "$PATHS" | tr ',' '\n' | while read -r p; do
+                p=$(echo "$p" | xargs)  # trim whitespace
+                if [ -n "$p" ]; then
+                  mkdir -p "$(dirname "$p")"
+                  git checkout "$SHA" -- "$p" 2>/dev/null && echo "  fetched: $p" || echo "  ⚠ could not fetch: $p"
+                fi
+              done
+            else
+              # No specific paths — checkout the whole tests/ directory from the commit
+              git checkout "$SHA" -- tests/ 2>/dev/null && echo "  fetched tests/ from $SHA" || echo "  ⚠ could not fetch tests/ from $SHA"
+            fi
+          fi
+
+          echo ""
+          echo "=== Spec files present ==="
+          find . -name "*.spec.ts" -not -path "*/node_modules/*" | sort || echo "(none found)"
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install Playwright browsers (Chromium only)
+        run: npx playwright install --with-deps chromium
+
+      - name: Validate required secrets
+        run: |
+          MISSING=""
+          [ -z "$SF_COMM_URL" ]           && MISSING="$MISSING SF_COMM_URL"
+          [ -z "$SF_COMM_USERNAME" ]      && MISSING="$MISSING SF_COMM_USERNAME"
+          [ -z "$SF_COMM_EFFECTIVE_PW" ]  && MISSING="$MISSING SF_COMM_EFFECTIVE_PW"
+          [ -z "$SF_SALES_URL" ]          && MISSING="$MISSING SF_SALES_URL"
+          [ -z "$SF_SALES_USERNAME" ]     && MISSING="$MISSING SF_SALES_USERNAME"
+          [ -z "$SF_SALES_EFFECTIVE_PW" ] && MISSING="$MISSING SF_SALES_EFFECTIVE_PW"
+          if [ -n "$MISSING" ]; then
+            echo "❌ Missing required GitHub secrets:$MISSING"
+            echo "Add them at: https://github.com/$GITHUB_REPOSITORY/settings/secrets/actions"
+            exit 1
+          fi
+          echo "✅ All required secrets present"
+          echo "   SF_COMM_URL  = $SF_COMM_URL"
+          echo "   SF_SALES_URL = $SF_SALES_URL"
+        env:
+          SF_COMM_URL:           ${{ secrets.SF_COMM_URL }}
+          SF_COMM_USERNAME:      ${{ secrets.SF_COMM_USERNAME }}
+          SF_COMM_EFFECTIVE_PW:  ${{ secrets.SF_COMM_EFFECTIVE_PW }}
+          SF_SALES_URL:          ${{ secrets.SF_SALES_URL }}
+          SF_SALES_USERNAME:     ${{ secrets.SF_SALES_USERNAME }}
+          SF_SALES_EFFECTIVE_PW: ${{ secrets.SF_SALES_EFFECTIVE_PW }}
+
+      - name: Run Playwright tests
+        id: run_tests
+        env:
+          SF_COMM_URL:           ${{ secrets.SF_COMM_URL }}
+          SF_COMM_USERNAME:      ${{ secrets.SF_COMM_USERNAME }}
+          SF_COMM_EFFECTIVE_PW:  ${{ secrets.SF_COMM_EFFECTIVE_PW }}
+          SF_SALES_URL:          ${{ secrets.SF_SALES_URL }}
+          SF_SALES_USERNAME:     ${{ secrets.SF_SALES_USERNAME }}
+          SF_SALES_EFFECTIVE_PW: ${{ secrets.SF_SALES_EFFECTIVE_PW }}
+        # Reporters are defined in playwright.config.ts (list + json → test-results.json + html).
+        # Do NOT pass --reporter here — CLI --reporter overrides config and drops the outputFile,
+        # causing test-results.json to never be written (JSON goes to stdout instead).
+        run: npx playwright test
+        continue-on-error: true   # upload report even on test failure
+
+      - name: Upload Playwright report to GitHub Actions
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report-${{ github.event.inputs.story_id || github.run_id }}
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 30
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        if: always()
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+        continue-on-error: true   # non-fatal if OIDC not configured
+
+      - name: Upload artifacts to S3
+        if: always()
+        env:
+          ARTIFACTS_BUCKET: ${{ secrets.ARTIFACTS_BUCKET }}
+        run: |
+          STORY="${{ github.event.inputs.story_id }}"
+          RUN_ID="${{ github.run_id }}"
+          S3_PREFIX="runs/${STORY}/${RUN_ID}"
+
+          if [ -z "$ARTIFACTS_BUCKET" ]; then
+            echo "ARTIFACTS_BUCKET secret not set — skipping S3 upload"
+            echo "S3_PREFIX=" >> "$GITHUB_ENV"
+          else
+            echo "Uploading artifacts to s3://${ARTIFACTS_BUCKET}/${S3_PREFIX}/"
+
+            if [ -d test-results ] && [ -n "$(ls -A test-results 2>/dev/null)" ]; then
+              aws s3 cp test-results/ "s3://${ARTIFACTS_BUCKET}/${S3_PREFIX}/test-results/" \
+                --recursive --quiet && echo "  ✅ test-results/ uploaded" \
+                || echo "  ⚠ test-results/ upload failed (non-fatal)"
+            fi
+
+            if [ -d playwright-report ] && [ -n "$(ls -A playwright-report 2>/dev/null)" ]; then
+              aws s3 cp playwright-report/ "s3://${ARTIFACTS_BUCKET}/${S3_PREFIX}/playwright-report/" \
+                --recursive --quiet && echo "  ✅ playwright-report/ uploaded" \
+                || echo "  ⚠ playwright-report/ upload failed (non-fatal)"
+            fi
+
+            echo "S3_PREFIX=${S3_PREFIX}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Post results back to QA Workbench API
+        if: always()
+        env:
+          QA_API_URL: ${{ secrets.QA_WORKBENCH_API }}
+        run: |
+          STATUS="${{ steps.run_tests.outcome }}"
+          STORY="${{ github.event.inputs.story_id }}"
+          PROJECT="${{ github.event.inputs.project }}"
+          ACTOR="${{ github.event.inputs.actor }}"
+          RUN_ID="${{ github.run_id }}"
+          REPO="${{ github.repository }}"
+          SHA="${{ github.event.inputs.commit_sha }}"
+          S3_PREFIX="${{ env.S3_PREFIX }}"
+
+          # ── Per-test details from Playwright JSON reporter (test-results.json) ──
+          # Extract each spec's title, status, duration, and attachment paths.
+          # Attachments use `rel` (path relative to test-results/) so the Lambda
+          # can generate presigned S3 URLs as: {s3_prefix}/test-results/{rel}
+          TESTS_JSON="[]"
+          SUMMARY_JSON='{"passed":0,"failed":0,"skipped":0,"duration":0}'
+
+          if [ -f test-results.json ]; then
+            TESTS_JSON=$(jq -c '[
+              .suites[]? as $top |
+              ($top.specs[]?, ($top.suites[]?.specs[]?)) |
+              select(. != null and has("title") and has("tests")) |
+              {
+                title: .title,
+                file: ($top.file // $top.title // ""),
+                ok: (.ok // false),
+                status: (if (.ok // false) then "passed" else "failed" end),
+                duration: ((.tests // []) | first? | (.results // []) | last? | .duration // 0),
+                error:    ((.tests // []) | first? | (.results // []) | last? | .errors[0]?.message // null),
+                attachments: [
+                  ((.tests // []) | first? | (.results // []) | last? | .attachments // [])[] |
+                  select(.path != null and .path != "") |
+                  { name: .name, contentType: (.contentType // ""), rel: (.path | split("test-results/") | last) }
+                ]
+              }
+            ]' test-results.json 2>/dev/null || echo "[]")
+
+            SUMMARY_JSON=$(jq -c '{
+              passed:   (.stats.expected   // 0),
+              failed:   (.stats.unexpected // 0),
+              skipped:  (.stats.skipped    // 0),
+              duration: (.stats.duration   // 0)
+            }' test-results.json 2>/dev/null || echo '{"passed":0,"failed":0,"skipped":0,"duration":0}')
+          fi
+
+          echo "Summary: $SUMMARY_JSON"
+          echo "Tests count: $(echo "$TESTS_JSON" | jq 'length' 2>/dev/null || echo '?')"
+
+          if [ -n "$QA_API_URL" ]; then
+            jq -n \
+              --arg  story_id    "$STORY" \
+              --arg  project     "$PROJECT" \
+              --arg  status      "$STATUS" \
+              --arg  run_id      "$RUN_ID" \
+              --arg  actor       "$ACTOR" \
+              --arg  repo        "$REPO" \
+              --arg  commit_sha  "$SHA" \
+              --arg  run_url     "https://github.com/$REPO/actions/runs/$RUN_ID" \
+              --arg  s3_prefix   "$S3_PREFIX" \
+              --argjson summary  "$SUMMARY_JSON" \
+              --argjson tests    "$TESTS_JSON" \
+              '{
+                story_id:            $story_id,
+                project:             $project,
+                status:              $status,
+                run_id:              $run_id,
+                actor:               $actor,
+                repo:                $repo,
+                commit_sha:          $commit_sha,
+                run_url:             $run_url,
+                s3_artifacts_prefix: $s3_prefix,
+                summary:             $summary,
+                tests:               $tests
+              }' \
+            | curl -sf -X POST "$QA_API_URL/runs/report" \
+                -H "Content-Type: application/json" \
+                --data-binary @- \
+              || echo "[QA Workbench] API post failed (non-fatal)"
+          else
+            echo "[QA Workbench] QA_WORKBENCH_API secret not set — skipping report post"
+          fi
