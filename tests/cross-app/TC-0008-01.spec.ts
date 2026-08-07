@@ -53,7 +53,7 @@ test.beforeAll({ timeout: 120_000 }, async () => {
   console.log('[beforeAll] salesPage Lightning origin:', lightningOrigin, '| url:', salesPage.url());
 });
 
-test.afterAll(async ({} , testInfo) => {
+test.afterAll(async ({}, testInfo) => {
   const commVideo = commPage?.video();
   const salesVideo = salesPage?.video();
 
@@ -103,14 +103,6 @@ test('TC-0008-01: Display test score with thousands separator on record detail p
   await commPage.locator('button[aria-label="Application Type"]').click({ force: true });
   await commPage.locator(`[role="option"][data-value="${testData.Application_Type__c}"]`).click();
 
-  const fafsaCheckbox = commPage.locator('input[name="FAFSA__c"]');
-  const isChecked = await fafsaCheckbox.isChecked();
-  if (testData.FAFSA__c && !isChecked) {
-    await fafsaCheckbox.check();
-  } else if (!testData.FAFSA__c && isChecked) {
-    await fafsaCheckbox.uncheck();
-  }
-
   const submitBtn = commPage.locator('button[name="SaveEdit"]');
   await submitBtn.waitFor({ state: 'visible', timeout: 15000 });
   await submitBtn.click();
@@ -148,15 +140,13 @@ test('TC-0008-01: Display test score with thousands separator on record detail p
   await salesPage.waitForLoadState('domcontentloaded');
   await salesPage.waitForTimeout(2000);
 
-  await expect(salesPage.getByText(testData.Email__c, { exact: false }).first()).toBeVisible({ timeout: 30000 });
-
   const formattedTestScore = testData.TestScore__c.toLocaleString('en-US');
-  console.log('[test] Asserting TestScore formatted as:', formattedTestScore);
+  console.log(`[test] Asserting TestScore formatted as: ${formattedTestScore}`);
   await expect(salesPage.getByText(formattedTestScore, { exact: false }).first()).toBeVisible({ timeout: 30000 });
 
   const formattedGPA = testData.GPA__c.toLocaleString('en-US');
-  console.log('[test] Asserting GPA formatted as:', formattedGPA);
   await expect(salesPage.getByText(formattedGPA, { exact: false }).first()).toBeVisible({ timeout: 30000 });
 
+  await expect(salesPage.getByText(testData.Email__c, { exact: false }).first()).toBeVisible({ timeout: 30000 });
   await expect(salesPage.getByText(testData.School_Name__c, { exact: false }).first()).toBeVisible({ timeout: 30000 });
 });
